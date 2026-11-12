@@ -1,139 +1,129 @@
 # minimi: a chat agent with web search and time-aware memory
 
-A chat agent that searches the live web **and remembers what it told you, when, and from which source**, so it can answer:
+A chat agent with one tool, **web search**, that also **remembers what you asked and when**. It can answer questions like:
 
 - "On Monday we shortlisted 5 CRM tools. Has any of them changed pricing or shipped something big since?"
 - "What did I ask you on 3 November? Is your answer still correct today?"
 - "Last Tuesday I asked about Postgres hosting. Has any pricing changed since then?"
 
-It runs at **$0**: Groq's free tier for the LLM (`openai/gpt-oss-120b`), Tavily's free tier for search, and a local SQLite file for memory. The design is in [`DESIGN.md`](DESIGN.md) (one page).
+It runs on free tiers: Groq (`openai/gpt-oss-120b`) for the model, Tavily for search, and a local SQLite file for memory. The design and its reasoning are in [`DESIGN.md`](DESIGN.md).
 
 ## Quick start
 
-Requires **Node 22.13+**, the first version where the built-in `node:sqlite` works without a flag. It has been run on Node 24; other versions have not been tested. There is no native build step.
+Requires **Node 22.13 or newer** (the first version where the built-in `node:sqlite` works without a flag). It has been run on Node 24.
 
 ```bash
 npm install
-cp .env.example .env          # add GROQ_API_KEY and TAVILY_API_KEY (both free, no card)
-npm run dev                   # http://localhost:3000
+cp .env.example .env    # add GROQ_API_KEY and TAVILY_API_KEY (both have free tiers)
+npm run dev             # http://localhost:3000
 ```
 
-If a key is missing, the server still starts and tells you which one to add.
+If a key is missing, the server still starts and says which key to add.
 
-**Speed.** Every turn has one deadline (25 s by default, `TURN_DEADLINE_MS`). Searching stops 8 s before it so there is always time to answer. If the deadline hits, you get what was already validated, marked incomplete; the turn is not left waiting. In a handful of live runs on the free tier, a plain lookup took about 4–5 s and a re-check of 4–5 products about 4–7 s, with the code-rendered comparison appearing before the model's text. That is a few runs, not a benchmark: the Groq free tier (8k tokens/minute) can still slow back-to-back turns.
+Turn on **Debug** (top right of the chat) to see, for each turn: the resolved dates, the memory given to the model, every search, the code-computed comparison, and the timings.
 
-### Try the memory features
+## Try the memory features
 
-A fresh install has no history, so the agent will honestly say it has no record of "Monday". The fastest way to test recall is to load **known** past conversations straight into a separate database. It is instant, uses no API credits, and gives the same memory every time:
+A fresh install has no history, so the agent will say it has no record of "Monday". To test recall, load five known past conversations into a separate database (no API calls, dates are set relative to today):
 
 ```bash
-DB_PATH=data/test.db npm run seed:fixtures   # dates relative to today: "Monday", "last Tuesday", "3 Nov" resolve to real days
-DB_PATH=data/test.db npm run dev             # start the server on the same database
+DB_PATH=data/test.db npm run seed:fixtures
+DB_PATH=data/test.db npm run dev
 ```
 
-It prints each question to ask and what a correct reply looks like. The five fixtures (in `scripts/fixtures.ts`) are:
-- a CRM shortlist with four stored prices (two from vendor pages, two third-party) and one item never priced;
-- Postgres hosting on the Tuesday *before* last Tuesday, with three stored non-price statements;
-- an unrelated cold email on last Tuesday, so "last Tuesday" is genuinely ambiguous;
-- Gemini prices with one deliberately altered value (flagged DEMO DATA);
-- a turn whose answer failed.
+The fixtures are:
 
-`npm run seed` instead replays scripted questions through the live pipeline with the clock set back (about 3 minutes and 15+ Tavily credits; it can hit rate limits). `--demo-change` alters one stored price, flagged as demo data.
+| Day (relative to today) | Conversation |
+|---|---|
+| Last Monday | A CRM shortlist: 4 stored prices (2 from vendor pages, 2 from third-party sites) and one item never priced |
+| The Tuesday before last | Postgres hosting: Neon and Supabase prices stored, AWS RDS named without a price |
+| Last Tuesday | An unrelated cold email, so "last Tuesday" is genuinely ambiguous |
+| Last Friday | Gemini API prices, with one value deliberately altered and flagged as demo data |
+| Last Sunday | A question whose answer failed: the question is remembered, but there are no earlier values |
 
-Turn on **Debug** (top right) to see the resolved dates, the injected memory, every search, the code-computed comparison rows, the timings and the call counts.
-
-### Other scripts
-
-```bash
-npm test                      # vitest: 179 tests, incl. full turns with scripted model + search (tests/integration.test.ts)
-npm run typecheck
-npm run ask -- "question"     # one turn from the CLI: prints the stream, debug summary, memory written, telemetry
-bash scripts/e2e.sh           # the sample questions + abstention + small talk, paced for the free tier
-FAKE_NOW=2026-11-11T10:00:00 npm run dev   # freeze the clock (dates resolve deterministically)
-```
+The seed command prints the questions to ask and what a correct reply looks like.
 
 ## How a turn works
 
-```
-browser (vanilla JS, SSE)  →  POST /api/chat {message, conversationId, tz}
-  one Deadline per turn: every search and model call gets its abort signal
-  1. time/resolve.ts       "Monday", "last Tuesday", "3 Nov" → local-date windows (code, ~0 ms)
-  2. agent/router.ts       memory? change? pure recall? launches? small talk? (regex, no LLM hop)
-  3. memory/retrieve.ts    all conversations, INCLUDING this one → <memory> block, or an explicit absence
-       └ pure recall, nothing found → answer straight from retrieval, no model call
-       └ re-check              → re-open the pages the earlier answer cited, search only the websites it
-                                 used (+ news), and run the code comparison BEFORE the model (prefetch)
-  4. search/tool.ts        parallel Tavily calls → dedupe, excerpt chunks that each carry the heading path and
-                           table header row, tiers (publisher relationships)
-       └ evidence/observations.ts   what each source states: prices (plan, unit, terms) + announcements, with dates
-       └ verify/reverify.ts         stored answer assertion vs official observation → comparison rows (code)
-  5. agent/loop.ts         validated comparison streams first; Groq gpt-oss-120b writes the rest (one tool, web_search)
-  6. answer/narrative.ts   strips the model's Then/Now tables, unsupported verdicts, unrecorded earlier values
-     answer/*              invalid [Sn] dropped; prices the cited source doesn't state are flagged
-  7. memory/assertions.ts  answer ↔ observation links, non-price statements, items, constraints → SQLite,
-                           written BEFORE the final event
-```
+1. **Dates.** Phrases like "Monday" or "last Tuesday" are turned into date ranges in the user's time zone, in code (`time/resolve.ts`).
+2. **Routing.** Simple rules decide whether the message is small talk, a memory question, or a "has it changed?" question (`agent/router.ts`). No model call is spent on this.
+3. **Memory.** Past conversations are searched by date and topic (SQLite full-text search) and given to the model as context. Memory is not a tool, so web search stays the only tool and recall costs no extra model call (`memory/retrieve.ts`).
+4. **Re-check.** For "has it changed?", or the same question asked again when the earlier answer stated prices, the code first re-opens the pages the earlier answer cited and searches only the websites it used, plus news since that date. It then compares the stored values with today's sources and shows the comparison before the model writes anything (`verify/reverify.ts`).
+5. **Search.** The model can call `web_search`. Results are deduplicated, rated (official vendor page or third-party), and cut into pieces that always keep the product heading and table header, so a price never loses its product name (`search/`).
+6. **Checks on the answer.** Citations must point to real results; prices must appear in the cited source; a "Confirmed" label is removed where they don't (`answer/`).
+7. **Save.** The answer is stored with the sources and values it used, before the reply completes, so later questions can be checked against it (`memory/assertions.ts`).
 
-**Memory is not a tool.** The harness injects it, so `web_search` stays the only tool and memory questions cost no extra LLM round-trip.
-
-**Call paths.**
-
-| Kind of turn | Model calls |
+| Kind of question | Model calls |
 |---|---|
 | Small talk | 1, with no tools |
-| "What did I ask on X?" with nothing stored | 0 |
-| Ordinary research | about 2 (decide to search, then answer) |
-| Re-check | usually 1 after the prefetch; at most 1 extra search round |
+| "What did I ask on X?" with nothing stored | 0 (answered from memory search) |
+| Ordinary research | About 2 (decide to search, then answer) |
+| Re-check | Usually 1 (the searches and comparison run before the model) |
 
-A small JSON model call happens only when code cannot read a needed value from an official page. It is one batched call, inside the deadline.
+Every turn has one time limit (25 s by default, `TURN_DEADLINE_MS`). Searching stops 8 s before it so there is always time to answer; if time runs out, what was already checked is shown and marked incomplete.
 
-## What code guarantees (and what it doesn't)
+## What the code guarantees
 
-| Guarantee | Enforced by |
-|---|---|
-| A "Then" value is a stored **answer assertion** (entity, plan, attribute, terms, date). Today's sources never establish what we said earlier. | `verify/reverify.ts` builds the rows; `answer/narrative.ts` and `answer/thenCheck.ts` strip anything else |
-| No baseline → "No earlier value recorded; cannot compare." Never "Unchanged". | `notRecordedRow`, narrative guard |
-| **Official** means the domain *is* the brand (hubspot.com) or is in a small parent-company table (Gemini → google.dev), with the reason recorded. Model-suggested domains, stored URLs and brand-containing domains (salesforceben.com) are never promoted. | `search/credibility.ts` |
-| A different plan is never substituted. A currency, unit, billing period, billing term or region stated on only one side is "not comparable". | `lookupCurrent`, `compareValues` |
-| Precision-aware equality: $0.001 → $0.002 is a change. Rounding is tolerated only for a converted yearly price. | `verify/diff.ts` |
-| "Differs from our earlier answer" is kept apart from "Changed". Changed needs evidence that the vendor's own statement changed. | `buildRow` |
-| "Now" must be current: a live vendor page (pricing, plans, docs) counts if updated within the last year, because a price unchanged since April is still today's price; an article (blog, news, changelog) counts only if published on or after the earlier answer. Conflicting official pages and third-party baselines stay visibly uncertain. | `answer/freshness.ts`, `lookupCurrent`, `buildRow` |
-| A price never travels without its product: excerpts restate the heading path and table header in every chunk, a search snippet is located on the page to recover its heading, and a model variant ("Flash-Lite", "Native Audio") is a different product. | `search/postprocess.ts`, `verify/support.ts` |
-| "Confirmed" needs an official, current source that states the value on that line; otherwise the label is withdrawn. | `answer/labels.ts` |
-| Publication date, fetch date (the original one on a cache hit) and effective/event date stay distinct. | `search/cache.ts`, `evidence/observations.ts` |
-| The verdict sentence is computed from the rows: never "nothing changed" above rows that couldn't be verified, never "still correct" while earlier non-price statements are unchecked. | `headline()`, narrative guard |
-| Memory reflects the delivered answer: table, prose and bullets store the same facts. Unsupported prices are kept but never used as baselines. | `memory/assertions.ts` |
-| Ambiguous dates with equally plausible matches show both dates, and the model is told to ask. Failed turns keep the question, never a fake answer. | `memory/retrieve.ts` |
+- **"Then" values come only from memory.** A past value is one the agent actually stored. Today's pages are never used to reconstruct what was said before.
+- **"Now" values must be current.** A vendor's live pricing or docs page counts if it was updated within the last year. An article (blog post, news, changelog) counts only if it was published on or after the earlier answer.
+- **Like is compared with like.** Same plan, currency, unit and billing terms. A different plan is never substituted, and there is no rounding.
+- **"Changed" needs evidence.** A value that differs from the earlier answer is shown as "differs from our earlier answer" unless a source shows the vendor changed it after that date.
+- **Official means the vendor's own site**, decided by domain with a recorded reason. Third-party sources are shown as "Reported", never "Confirmed".
+- **"Confirmed" requires the cited page to state the value.**
+- **No blanket "nothing changed"** above rows that could not be checked.
 
-**What code does not guarantee:** that every generated sentence is true. Non-price statements are listed for the model to judge against today's sources, not verified by code. Conservative results are deliberate. On real pricing pages, many rows end as "Can't verify" or "Not comparable" because the page doesn't name the plan, or states terms the stored value didn't.
+What the code does **not** guarantee: that every sentence the model writes is true. Statements other than prices are listed for the reader, not verified by code. The agent is deliberately cautious: when a page doesn't name the plan or states different terms, the row says "can't verify" instead of guessing.
 
-## Free-tier limits and cost
+## Measured on live runs (12 Nov 2026, free tiers)
 
-- **Groq:** 8,000 tokens/minute per model. The whole request (system prompt, memory, history, tool results and the tool definition) is fitted under about 5.8k tokens. Older search excerpts are shortened first; source headers and the comparison block never are. On a 429, the client waits only if `retry-after` is short (≤ 6 s) and fits the time left; otherwise it moves on to `gpt-oss-20b` (a separate bucket). There is one pass over the chain, with no minute-long second round. Optional fallbacks: `GEMINI_API_KEY`, `OPENROUTER_API_KEY`.
-- **Tavily:** about 1,000 free credits a month, and every call is `search_depth: "basic"` (1 credit). A lookup costs 1–4 credits. A re-check costs 2 per product, or 3 when the question asks about launches (current page + news + vendor release notes), plus 1 credit per 5 earlier-cited pages it re-opens. Results are cached in memory for 15 minutes.
+| Run | Total time | Search credits | Result |
+|---|---|---|---|
+| Postgres re-check (3 stored prices) | 10.1 s | 7 | All 3 prices verified unchanged on the vendors' own sites |
+| CRM re-check (5 items) | 5.2 s | 16 | 1 verified; the others had third-party or renamed plans, or no earlier value |
+| Price lookup (Gemini 2.5 Flash) on a fresh install | about 11 s | — | Correct price, cited to Google's pricing page |
 
-## Layout
+These are single runs, not a benchmark. The Groq free tier (8,000 tokens per minute) can slow down questions asked back to back.
 
-```
-src/server.ts              Hono routes: POST /api/chat (SSE), GET /api/conversations[/:id], GET /api/health, static client
-src/config.ts              env, model chain, budgets (turn deadline, answer reserve), FAKE_NOW
-src/agent/                 loop.ts (turn + persistence), deadline.ts, prompt.ts, router.ts
-src/time/                  resolve.ts (date windows), tz.ts (Intl helpers)
-src/memory/                db.ts (schema), retrieve.ts, assertions.ts (memory writer), parseClaims.ts
-src/evidence/              observations.ts (what each source states)
-src/search/                tool.ts (web_search), tavily.ts, postprocess.ts, credibility.ts, cache.ts
-src/verify/                reverify.ts (comparison + rendering), diff.ts, support.ts
-src/answer/                narrative.ts, thenCheck.ts, citations.ts, autocite.ts, labels.ts
-src/llm/client.ts          OpenAI SDK → Groq (+ fallbacks), deadline-bound retries, JSON mode with zod
-public/                    index.html, app.js, style.css (no build step)
-scripts/                   fixtures.ts + seed-fixtures.ts, seed.ts, ask.ts, e2e.sh
-tests/                     vitest suites (unit + integration)
-```
+## Free-tier limits
+
+- **Groq:** 8,000 tokens per minute per model. Each request is kept under about 5,800 tokens (older search excerpts are shortened first). On a rate limit, it waits only if the wait is 6 s or less, otherwise it switches to `gpt-oss-20b`. Optional fallbacks: `GEMINI_API_KEY`, `OPENROUTER_API_KEY`.
+- **Tavily:** every search uses `search_depth: "basic"` (1 credit). Re-opening earlier pages costs 1 credit per 5 pages. Results are cached in memory for 15 minutes.
 
 ## Known limitations
 
-- Single user, no auth. All conversations share one memory.
-- Retrieval is keyword-based (FTS5/BM25 + stored entity names) with no embeddings, so it misses paraphrases.
-- Observation extraction and routing are English-language heuristics.
-- Announcement detection matches at the brand level, so it can surface loosely related posts. The text and dates are shown so you can judge them.
-- Latency and answer quality have been checked on a few live runs, not measured with an evaluation set.
+- Single user, no login. All conversations share one memory.
+- Memory search is by keyword (no embeddings), so it can miss paraphrases.
+- Date and intent rules are written for English.
+- Plan renames are not recognised (for example Salesforce "Essentials" → "Starter").
+- Prices that a website draws with scripts are invisible to the page reader, so they can't be verified.
+- The model sometimes writes an answer without citations. This is flagged in the answer, not fixed.
+- The word "release" counts as time-sensitive, so a writing request that mentions it triggers an unnecessary search.
+- Latency and accuracy have been checked on a few live runs, not measured with an evaluation set.
+
+## Scripts
+
+```bash
+npm test                     # 179 tests (vitest), including full turns with a scripted model and search
+npm run typecheck
+npm run ask -- "question"    # one turn from the command line, with a debug summary
+npm run seed                 # replay scripted questions through the live pipeline (uses API credits)
+FAKE_NOW=2026-11-11T10:00:00 npm run dev   # freeze the clock for date testing
+```
+
+## Project layout
+
+```
+src/server.ts      HTTP routes: POST /api/chat (streaming), conversations, health, static client
+src/config.ts      environment, models, time and size budgets, FAKE_NOW
+src/agent/         the turn (loop.ts), time limit, prompt, routing, clarifying replies
+src/time/          date phrases → date ranges, time-zone helpers
+src/memory/        SQLite schema, memory search, what gets stored from each answer
+src/search/        web_search tool, Tavily client, excerpts, source rating, cache
+src/evidence/      what each source states (prices, announcements), with dates
+src/verify/        then-vs-now comparison, value matching, source support checks
+src/answer/        checks on the model's answer: citations, labels, freshness, grounding
+src/llm/           model client with fallbacks and retries
+public/            the chat UI (plain HTML, CSS and JavaScript, no build step)
+scripts/           fixtures, seeding, command-line ask, end-to-end script
+tests/             unit and integration tests
+```
