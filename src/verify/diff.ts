@@ -179,12 +179,22 @@ export function compareValues(prev: string, next: string | null, q: { prev?: Qua
       if (!a.basis || !b.basis) return nc(`unit stated on only one side (${a.basis ?? 'none'} vs ${b.basis ?? 'none'})`);
       return nc(`not comparable (${a.basis} vs ${b.basis})`);
     }
-    if (a.period !== b.period) {
-      if (a.period === 'none' || b.period === 'none') return nc('billing period stated on only one side');
-      return nc(`different billing periods (${a.period} vs ${b.period})`);
-    }
     const qa = mergeQualifiers(q.prev, detectQualifiers(prev));
     const qb = mergeQualifiers(q.next, detectQualifiers(next));
+    if (a.period !== b.period) {
+      if (a.period === 'none' || b.period === 'none') {
+        // The SAME number for the same unit and terms, with the period written on only one side
+        // ("$9/seat (billed annually)" today vs "$9 per seat per month, billed annually" then): nothing
+        // points to a change. A different number can't be read this way, so it stays not comparable.
+        // Live regression: HubSpot's own page re-read with the same $9 was shown as "not comparable".
+        // Billing/region terms must agree (both stated and equal, or both unstated), as for any match.
+        const termsAgree = (['billing', 'region'] as const).every((k) => (qa[k] ?? null) === (qb[k] ?? null));
+        if (!a.free && !b.free && !a.converted && !b.converted && a.stated === b.stated && termsAgree)
+          return { status: 'unchanged', note: 'same amount; the source does not state the billing period', comparable: true };
+        return nc('billing period stated on only one side');
+      }
+      return nc(`different billing periods (${a.period} vs ${b.period})`);
+    }
     const oneSided: string[] = [];
     for (const k of ['billing', 'region'] as const) {
       if (qa[k] && qb[k] && qa[k] !== qb[k]) return nc(`different ${k} terms (${qa[k]} vs ${qb[k]})`);

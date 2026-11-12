@@ -126,7 +126,8 @@ describe('focusedSection', () => {
 
   it('picks the heading that best matches the query, not a near miss', () => {
     const s = focusedSection(page, 'Gemini 2.5 Flash API pricing', 500)!;
-    expect(s.startsWith('## Gemini 2.5 Flash\n')).toBe(true);
+    // The section restates its full heading path, so the product name always travels with its rows.
+    expect(s.startsWith('# Pricing\n## Gemini 2.5 Flash\n')).toBe(true);
     expect(s).toContain('$0.30');
     expect(s).not.toContain('$0.10');
     expect(s).not.toContain('Batch'); // link bars stripped

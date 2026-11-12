@@ -8,6 +8,7 @@
 //     the label says so instead of presenting the converted figure as confirmed.
 
 import type { Evidence } from '../search/postprocess.js';
+import { valueAppearsIn } from '../verify/diff.js';
 import { isStale } from './freshness.js';
 
 // The model sometimes invents synonyms ("Verified"); they get the same rule as "Confirmed".
@@ -35,6 +36,27 @@ export function enforceLabels(text: string, evidence: Evidence[], today?: string
     }
     const label = cites.length ? 'Reported' : 'Unverified (no source this turn)';
     return line.replace(CONFIRMED, (_m, a, b) => `${a ?? ''}${label}${b ?? ''}`);
+  });
+  return { text: lines.join('\n'), downgraded };
+}
+
+/**
+ * Second half of the label rule: the cited page must not only be official and current, it must STATE
+ * the value. The claim check found values the cited source doesn't state (`misses`); on any line that
+ * shows one of them, cites that source and says "Confirmed", the label is replaced. Live regression:
+ * "| Input tokens | $2.00 | Confirmed – ai.google.dev [S2] |" above "Not confirmed by the cited source:
+ * … $2.00: S2 does not mention Gemini 2.5 Flash".
+ */
+export function markUnconfirmed(text: string, misses: { value: string; ids: string[] }[]): { text: string; downgraded: number } {
+  if (!misses.length) return { text, downgraded: 0 };
+  let downgraded = 0;
+  const lines = text.split('\n').map((line) => {
+    if (!/\b(?:Confirmed|Verified)\b/.test(line)) return line;
+    const cites = new Set([...line.matchAll(/\[(S\d+)\]/g)].map((m) => m[1]));
+    const hit = misses.some((m) => (!m.ids.length || m.ids.some((id) => cites.has(id))) && valueAppearsIn(m.value, line));
+    if (!hit) return line;
+    downgraded++;
+    return line.replace(CONFIRMED, (_m, a, b) => `${a ?? ''}Not confirmed${b ?? ''} (the cited source doesn't state this value)`);
   });
   return { text: lines.join('\n'), downgraded };
 }

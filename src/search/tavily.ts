@@ -57,3 +57,33 @@ export async function tavilySearch(p: TavilyParams, signal?: AbortSignal): Promi
   const json = (await res.json()) as { results?: TavilyResult[]; response_time?: number };
   return { results: json.results ?? [], response_time: json.response_time, credits: 1 };
 }
+
+export interface ExtractResponse {
+  results: { url: string; title: string; raw_content: string }[];
+  failed: string[];
+  credits: number;
+}
+
+/**
+ * Open specific pages now (Tavily Extract, "basic": 1 credit per 5 pages read). Used to re-read the
+ * exact pages an earlier answer cited. Redirects are followed, so a vendor that moved its site
+ * (neon.tech → neon.com) still yields the current page.
+ */
+export async function tavilyExtract(urls: string[], signal?: AbortSignal): Promise<ExtractResponse> {
+  if (!config.tavilyKey) throw new Error('TAVILY_API_KEY is not set');
+  if (!urls.length) return { results: [], failed: [], credits: 0 };
+  const timeout = AbortSignal.timeout(15_000);
+  const res = await fetch('https://api.tavily.com/extract', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${config.tavilyKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ urls, extract_depth: 'basic', format: 'markdown' }),
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Tavily extract ${res.status}: ${text.slice(0, 200)}`);
+  }
+  const json = (await res.json()) as { results?: { url: string; title?: string | null; raw_content?: string | null }[]; failed_results?: { url: string }[] };
+  const results = (json.results ?? []).filter((r) => r.raw_content?.trim()).map((r) => ({ url: r.url, title: r.title ?? '', raw_content: r.raw_content! }));
+  return { results, failed: (json.failed_results ?? []).map((f) => f.url), credits: Math.ceil(results.length / 5) };
+}

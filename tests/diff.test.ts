@@ -42,8 +42,14 @@ describe('compareValues', () => {
     const annual = { prev: { billing: 'annual' as const } };
     expect(compareValues('$9 per seat per month', '$9/seat/mo (billed annually)', annual).status).toBe('unchanged');
     expect(compareValues('$9 per seat per month', '$12/seat/mo (billed annually)', annual).status).toBe('changed');
-    // "$9/seat (billed annually)" states no price period: unknown, so not comparable with "per month".
-    expect(compareValues('$9 per seat per month', '$9/seat (billed annually)', annual).status).toBe('cant_verify');
+    // "$9/seat (billed annually)" states no price period. The SAME number for the same unit and billing
+    // terms shows no change, so it reads as unchanged (with the gap said); a DIFFERENT number can't be
+    // read without the period, so it stays not comparable.
+    const same = compareValues('$9 per seat per month', '$9/seat (billed annually)', { ...annual, next: { billing: 'annual' as const } });
+    expect(same).toMatchObject({ status: 'unchanged', note: 'same amount; the source does not state the billing period' });
+    expect(compareValues('$9 per seat per month', '$12/seat (billed annually)', { ...annual, next: { billing: 'annual' as const } }).status).toBe('cant_verify');
+    // …and not when the billing terms are stated on only one side.
+    expect(compareValues('$9 per seat per month', '$9/seat', annual).status).toBe('cant_verify');
     // A real yearly price still converts.
     expect(compareValues('$25 per month billed annually', '$300 per year, billed annually').status).toBe('unchanged');
   });

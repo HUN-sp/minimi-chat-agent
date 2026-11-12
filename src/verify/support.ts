@@ -58,11 +58,23 @@ export function supportedBy(value: string, entity: string, ev: Evidence): Suppor
     return need.every((t) => all.has(t)) ? { ok: true, sourceId: ev.id } : { ok: false, sourceId: ev.id, reason: `${ev.id} does not mention ${entity}` };
   }
   for (const s of secs) {
-    const scope = new Set([...context, ...sectionTokens(s.heading)]);
-    if (need.every((t) => scope.has(t))) return { ok: true, sourceId: ev.id };
+    const heading = sectionTokens(s.heading);
+    const scope = new Set([...context, ...heading]);
+    // "Gemini 2.5 Flash Native Audio" contains every word of "Gemini 2.5 Flash" but is another model.
+    const variant = heading.filter((t) => VARIANT_WORDS.has(t) && !need.includes(t));
+    if (need.every((t) => scope.has(t)) && !variant.length) return { ok: true, sourceId: ev.id };
   }
   return { ok: false, sourceId: ev.id, reason: `in ${ev.id} the value sits under "${secs[0].heading}", not ${entity}` };
 }
+
+/**
+ * Words that turn a product name into a DIFFERENT product (a model variant), not a plan of it:
+ * "Gemini 2.5 Flash-Lite", "… Native Audio", "… Image Preview", "GPT-4o mini". Plan names such as
+ * Pro, Plus, Max or Starter are deliberately absent: "HubSpot" priced under "Sales Hub Starter" is
+ * still HubSpot. Live regression: an ai.google.dev "Gemini 2.5 Flash Native Audio" price ($2.00)
+ * was answered as the Gemini 2.5 Flash price.
+ */
+export const VARIANT_WORDS = new Set(['lite', 'mini', 'nano', 'micro', 'preview', 'audio', 'native', 'image', 'images', 'tts', 'live', 'embedding', 'embeddings', 'realtime', 'vision', 'transcribe']);
 
 /** Supported by at least one of the cited sources? */
 export function supportedByAny(value: string, entity: string, sourceIds: string[], byId: Map<string, Evidence>): Support {

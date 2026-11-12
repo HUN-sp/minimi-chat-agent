@@ -313,7 +313,14 @@ export function retrieveMemory(opts: { message: string; windows: DateWindow[]; r
   const unvalued = members.filter((n) => !baselines.some((c) => c.entity.toLowerCase() === n.toLowerCase() || entityMentioned(n, c.entity)));
   const factEntities = [...new Set(facts.map((f) => f.entity))].filter((e) => !baselines.some((c) => c.entity === e) && !unvalued.includes(e));
   const entities = [...new Set([...baselines.map((c) => c.entity), ...unvalued, ...factEntities])];
-  const recheck = route.changeIntent && anchorDate && (baselines.length || unvalued.length || facts.length) ? buildRecheckPlan(baselines, anchorDate, unvalued, factEntities) : null;
+  // Re-check against the earlier answer's own sources: for "has it changed?", and for the same question
+  // asked again when the earlier answer stated prices (then vs now, from the same websites).
+  const recheck =
+    route.changeIntent && anchorDate && (baselines.length || unvalued.length || facts.length)
+      ? buildRecheckPlan(baselines, anchorDate, unvalued, factEntities)
+      : repeatOf && anchorDate && baselines.length
+        ? buildRecheckPlan(baselines, anchorDate)
+        : null;
   if (route.changeIntent && turns.length) {
     if (!baselines.length) {
       notes.push(

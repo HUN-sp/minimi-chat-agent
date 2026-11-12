@@ -5,18 +5,20 @@
 //   • "Then" is a stored answer assertion (entity, attribute, plan, qualifiers, date) — never a number
 //     found elsewhere, and never today's source;
 //   • "Now" is an observation from the entity's official publisher, for the SAME plan (another plan is
-//     never substituted), comparable in currency/unit/period/terms, not from a page dated before the
-//     anchor, and not contradicted by another official source.
+//     never substituted), comparable in currency/unit/period/terms, current (a live vendor page updated
+//     within a year, or an article published on/after the anchor: see answer/freshness.ts), and not
+//     contradicted by another official source.
 // "The source now differs from what we said" is distinguished from "the vendor changed its price":
 // the latter needs evidence that the vendor's own statement changed after the anchor.
 
 import { z } from 'zod';
+import { pageKind, tooOldForNow } from '../answer/freshness.js';
 import { type Observation } from '../evidence/observations.js';
 import { type CallBudget, chatJSON } from '../llm/client.js';
 import { type ClaimRow, isBaseline } from '../memory/db.js';
 import { describeUnit, normalizeText } from '../memory/parseClaims.js';
-import { publisherRelation, registrableDomain } from '../search/credibility.js';
-import { type Evidence, sectionTokens } from '../search/postprocess.js';
+import { hostOf, publisherRelation, registrableDomain } from '../search/credibility.js';
+import { type Evidence, canonicalizeUrl, sectionTokens } from '../search/postprocess.js';
 import { parseIsoDate, prettyDate } from '../time/tz.js';
 import { type DiffStatus, type Qualifiers, compareValues, detectQualifiers, joinValue, parseQualifiers, valueAppearsIn } from './diff.js';
 import { brandMentioned, entityNeed, sections, supportedBy } from './support.js';
@@ -25,31 +27,52 @@ export interface RecheckPlan {
   since: string;
   queries: string[];
   domains: string[];
+  /** The exact pages the earlier answer cited, to be opened again now (same source, then vs now). */
+  pages: { url: string; entity: string; query: string }[];
+  /** Per query: the websites the earlier answer used for that item. The re-check searches only these. */
+  sites: Record<string, string[]>;
 }
 
+/** Most pages re-opened per re-check (Tavily extract: 1 credit per 5 pages). */
+export const MAX_REREAD_PAGES = 8;
+
 /**
- * One query per entity (plan/attribute words included), domains from the stored official sources
- * (search hints only). `unvalued`: items the user listed with no stored value (e.g. the answer
- * failed) — they get a plain "<name> pricing" query so "has any of them changed?" covers them.
- * `factEntities`: products the earlier answer made non-price statements about.
+ * One query per entity (plan/attribute words included). Re-checking an earlier answer goes back to
+ * ITS sources: the pages it cited are opened again, and each item's search is restricted to the
+ * websites the earlier answer used for that item, so "then" and "now" come from the same place.
+ * `unvalued`: items the user listed with no stored value (e.g. the answer failed) — they get a plain
+ * "<name> pricing" query (no earlier source, so no restriction). `factEntities`: products the
+ * earlier answer made non-price statements about.
  */
 export function buildRecheckPlan(claims: ClaimRow[], since: string, unvalued: string[] = [], factEntities: string[] = []): RecheckPlan | null {
   const base = claims.filter(isBaseline);
   if (!base.length && !unvalued.length && !factEntities.length) return null;
   const byEntity = new Map<string, ClaimRow[]>();
   for (const c of base) byEntity.set(c.entity, [...(byEntity.get(c.entity) ?? []), c]);
+  const sites: Record<string, string[]> = {};
+  const pages: RecheckPlan['pages'] = [];
   const queries = [...byEntity.entries()].map(([entity, cs]) => {
     const plans = [...new Set(cs.map((c) => c.plan).filter(Boolean))].slice(0, 2).join(' ');
     const isPrice = cs.some((c) => /price|cost|fee/i.test(c.attribute));
-    return `${entity} ${plans} ${isPrice ? 'pricing' : cs[0].attribute.replace(/[._]/g, ' ')}`.replace(/\s+/g, ' ').trim();
+    const query = `${entity} ${plans} ${isPrice ? 'pricing' : cs[0].attribute.replace(/[._]/g, ' ')}`.replace(/\s+/g, ' ').trim();
+    // The registrable domain (blog.hubspot.com → hubspot.com), so the same website's pricing page is found too.
+    const urls = [...new Set(cs.map((c) => c.source_url).filter((u): u is string => !!u))];
+    const doms = [...new Set(urls.map((u) => registrableDomain(hostOf(u))).filter(Boolean))];
+    if (doms.length) sites[query] = doms;
+    for (const url of urls) pages.push({ url, entity, query });
+    return query;
   });
   for (const name of unvalued) queries.push(`${name} pricing`);
   const covered = (n: string) => queries.some((q) => q.toLowerCase().includes(n.toLowerCase()));
   for (const name of factEntities) if (!covered(name)) queries.push(name);
-  // The vendor's registrable domain, not the exact stored host: blog.hubspot.com must not keep the
-  // search away from hubspot.com/pricing. A search hint only; tiers are decided per result.
   const domains = [...new Set(base.filter((c) => c.source_tier === 'official' && c.source_url && publisherRelation(c.source_url, c.entity)).map((c) => registrableDomain(c.source_domain!)))];
-  return { since, queries: [...new Set(queries)].slice(0, 6), domains };
+  // Official pages first when there are more than we re-open.
+  const official = (p: (typeof pages)[number]) => (publisherRelation(p.url, p.entity) ? 0 : 1);
+  const picked = pages
+    .filter((p, i) => pages.findIndex((x) => x.url === p.url) === i)
+    .sort((a, b) => official(a) - official(b))
+    .slice(0, MAX_REREAD_PAGES);
+  return { since, queries: [...new Set(queries)].slice(0, 6), domains, pages: picked, sites };
 }
 
 /** "input_price_le_200_k_tokens" ≈ "input_price_prompts_le_200k_tokens" → "inputle200k". */
@@ -73,7 +96,7 @@ const PLAN_GENERIC = new Set(['plan', 'plans', 'tier', 'edition', 'package', 'th
  * lacks must be product-line words present in the source's title/heading ("Sales Hub Starter" vs
  * "Starter" on a page titled "HubSpot Sales Hub pricing"). Disjoint plans never match.
  */
-export function planMatch(stored: string | null, found: string | null, entity: string, context: string): 'match' | 'mismatch' | 'unknown' {
+export function planMatch(stored: string | null, found: string | null, entity: string, context: string, headingPath = ''): 'match' | 'mismatch' | 'unknown' {
   const own = new Set(sectionTokens(entity));
   const toks = (p: string) => [...new Set(sectionTokens(p))].filter((w) => !own.has(w) && !PLAN_GENERIC.has(w));
   const ctx = new Set(sectionTokens(context));
@@ -81,6 +104,11 @@ export function planMatch(stored: string | null, found: string | null, entity: s
   const A = toks(stored);
   if (!A.length) return 'match';
   const B = found ? toks(found) : [];
+  // The stored plan is a heading ABOVE the price, and the "found plan" is only a deeper heading in that
+  // same path ("Launch › Usage-based › $0.106 per CU-hr"): the price sits inside the stored plan's
+  // section. Live regression: Neon's re-read pricing page gave "Usage-based ≠ Launch" for Launch's own price.
+  const path = new Set(sectionTokens(headingPath));
+  if (path.size && A.every((w) => path.has(w)) && B.every((w) => path.has(w))) return 'match';
   if (!B.length) return A.every((w) => ctx.has(w)) ? 'match' : 'unknown';
   if (!A.some((w) => B.includes(w))) return 'mismatch';
   const extra = [...A.filter((w) => !B.includes(w)), ...B.filter((w) => !A.includes(w))];
@@ -119,13 +147,15 @@ export function lookupCurrent(c: ClaimRow, evidence: Evidence[], anchor: string,
         // A row label like "Acme CRM Pro" carries the plan in the product name.
         const plan = obs.plan ?? planFromName(obs.entity, c.entity);
         const o = plan === obs.plan ? obs : { ...obs, plan };
-        all.push({ obs: o, ev, pm: planMatch(c.plan, o.plan, c.entity, `${ev.title} ${headingOf(ev, obs.span)}`) });
+        const path = headingOf(ev, obs.span);
+        all.push({ obs: o, ev, pm: planMatch(c.plan, o.plan, c.entity, `${ev.title} ${path}`, path) });
       }
   if (!all.length) return { kind: 'none' };
-  // A page published before the anchor can't say what the price is TODAY, whatever its plan wording.
-  // Live regression: Neon's Aug 2025 pricing blog ($0.14/CU-hour, superseded) was shown as the "Now"
-  // value of a 3 Nov 2026 re-check because the "plan not named" branch skipped the date test.
-  const cands = all.filter((x) => !(x.ev.publishedAt && x.ev.publishedAt < anchor));
+  // Only sources that can state TODAY's value (answer/freshness.ts): a live vendor page updated within
+  // a year (a price unchanged since April is today's price), or an article published on/after the
+  // anchor. Applied before every plan branch. Live regression: Neon's Aug 2025 pricing blog
+  // ($0.14/CU-hour, superseded) was shown as the "Now" value of a 3 Nov 2026 re-check.
+  const cands = all.filter((x) => !tooOldForNow(x.ev, anchor, today));
   if (!cands.length) {
     const prefer = all.find((x) => x.pm === 'match' && publisherRelation(x.ev.url, c.entity)) ?? all.find((x) => publisherRelation(x.ev.url, c.entity)) ?? all[0];
     return { kind: 'stale', obs: prefer.obs, ev: prefer.ev };
@@ -150,7 +180,7 @@ export function lookupCurrent(c: ClaimRow, evidence: Evidence[], anchor: string,
   const official = usable.filter((x) => publisherRelation(x.ev.url, c.entity));
   if (!official.length) return { kind: 'reported', ...usable[0] };
   const future = official.filter((x) => x.obs.effectiveDate && x.obs.effectiveDate > today);
-  const old = official.filter((x) => !future.includes(x) && x.ev.publishedAt && x.ev.publishedAt < anchor);
+  const old = official.filter((x) => !future.includes(x) && tooOldForNow(x.ev, anchor, today));
   let current = official.filter((x) => !future.includes(x) && !old.includes(x));
   if (!current.length) return future.length ? { kind: 'future', ...future[0] } : { kind: 'stale', ...old[0] };
 
@@ -165,6 +195,13 @@ export function lookupCurrent(c: ClaimRow, evidence: Evidence[], anchor: string,
   const comparable = current.filter((x) => compareValues(joinValue(c), joinValue(x.obs), { prev: cq, next: x.obs.qualifiers }).comparable !== false);
   if (!comparable.length) return { kind: 'found', ...current[0] };
   current = comparable;
+  // One page listing several prices in the same unit for the plan (storage, history, snapshots… all
+  // "per GB-month") is not two sources disagreeing: if it still states our exact value, it states it.
+  // Different pages with different values remain a conflict below.
+  if (new Set(current.map((x) => x.ev.id)).size === 1 && current.length > 1) {
+    const same = current.find((x) => compareValues(joinValue(c), joinValue(x.obs), { prev: cq, next: x.obs.qualifiers }).status === 'unchanged');
+    if (same) return { kind: 'found', ...same };
+  }
   // Two official statements of different comparable values: a conflict, not a verdict.
   for (let i = 0; i < current.length; i++)
     for (let j = i + 1; j < current.length; j++)
@@ -249,13 +286,25 @@ export function buildRow(c: ClaimRow, lookup: Lookup, anchor: string, today: str
   switch (lookup.kind) {
     case 'none':
       return cant('no current value for this item was found on an official source');
-    case 'reported':
-      return cant(`only a ${lookup.ev.tier} source (${lookup.ev.domain}) states ${joinValue(lookup.obs)} [${lookup.ev.id}]; not the vendor's own page, so no verdict`, nowOf(lookup.obs, lookup.ev, today), 'Reported');
-    case 'stale':
+    case 'reported': {
+      const samePage = !!c.source_url && lookup.ev.canonicalUrl === canonicalizeUrl(c.source_url);
       return cant(
-        `the only ${publisherRelation(lookup.ev.url, c.entity) ? 'official ' : ''}figure found is on a page published ${lookup.ev.publishedAt}, before ${anchor}; it does not establish today's price`,
+        samePage
+          ? `the same page the earlier answer used (${lookup.ev.domain}, ${lookup.ev.tier}) states ${joinValue(lookup.obs)} today [${lookup.ev.id}]; it is not the vendor's own page, so this is reported, not confirmed`
+          : `only a ${lookup.ev.tier} source (${lookup.ev.domain}) states ${joinValue(lookup.obs)} [${lookup.ev.id}]; not the vendor's own page, so no verdict`,
+        nowOf(lookup.obs, lookup.ev, today),
+        'Reported',
+      );
+    }
+    case 'stale': {
+      const off = publisherRelation(lookup.ev.url, c.entity) ? 'official ' : '';
+      return cant(
+        pageKind(lookup.ev) === 'article'
+          ? `the only ${off}figure found is in an article published ${lookup.ev.publishedAt}, before ${anchor}; an article that old does not establish today's price`
+          : `the only ${off}figure found is on a page last updated ${lookup.ev.publishedAt}, over a year ago; it may no longer show today's price`,
         nowOf(lookup.obs, lookup.ev, today),
       );
+    }
     case 'future':
       return cant(`the official source states ${joinValue(lookup.obs)} effective ${lookup.obs.effectiveDate} (not yet in effect)`, nowOf(lookup.obs, lookup.ev, today));
     case 'conflict':
@@ -271,8 +320,12 @@ export function buildRow(c: ClaimRow, lookup: Lookup, anchor: string, today: str
       const now = nowOf(obs, ev, today);
       const cmp = compareValues(joinValue(c), joinValue(obs), { prev: base.then.qualifiers, next: obs.qualifiers });
       if (cmp.status === 'cant_verify') return cant(cmp.note ?? 'not comparable', now, "Can't verify", 'not_comparable');
-      if (cmp.status === 'unchanged')
-        return { ...base, now, status: 'unchanged', label: 'Confirmed', note: reportedBaseline ? `${reportedBaseline}; the vendor's page states the same value today` : undefined };
+      if (cmp.status === 'unchanged') {
+        // A live page last edited before the anchor still shows today's price: the value hasn't changed since.
+        const lastEdit = ev.publishedAt && ev.publishedAt < anchor ? `the vendor's page (last updated ${ev.publishedAt}) still states this value today` : '';
+        const note = [reportedBaseline ? `${reportedBaseline}; the vendor's page states the same value today` : lastEdit, cmp.note].filter(Boolean).join('; ');
+        return { ...base, now, status: 'unchanged', label: 'Confirmed', note: note || undefined };
+      }
       // The numbers differ. Did the VENDOR change it after the anchor, or was our earlier answer off?
       const evidenceOfChange =
         (!c.demo && c.source_url && publisherRelation(c.source_url, c.entity) && c.source_excerpt && valueAppearsIn(c.value, c.source_excerpt)
@@ -380,7 +433,7 @@ export async function compareClaims(
           notes.set(c.id, `found "${value}" but ${v.reason}`);
           continue;
         }
-        const stale = ev.publishedAt && ev.publishedAt < anchor;
+        const stale = tooOldForNow(ev, anchor, today);
         lookups.set(c.id, stale ? { kind: 'stale', obs: v.obs, ev } : { kind: 'found', obs: v.obs, ev });
       }
     } catch {

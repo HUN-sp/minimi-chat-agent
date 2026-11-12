@@ -119,6 +119,19 @@ export function effectiveDateIn(text: string, ref: Date): string | null {
 const PLAN_NEAR = /\b(?:the\s+)?([A-Z][\w+.-]*(?:\s+[A-Z][\w+.-]*){0,2})\s+(?:plan|edition|tier|package)\b/;
 const LEAD_LABEL = /^\**([^:$€£₹*]{2,60}?)\**\s*[:–—-]\s/;
 
+/**
+ * Can a section heading be a plan name ("Starter", "Sales Hub Professional", "### Launch")? Not an
+ * article's sentence-like heading: "Close alternatives at a glance", "What a 5-seat team pays for
+ * follow-up automation", "1. Pipedrive: the closest swap" (live regression: those were shown to the
+ * user as the "plans" a page listed).
+ */
+function looksLikePlanHeading(h: string): boolean {
+  const t = h.trim();
+  if (!t || /pric|plan|cost|overview|compar/i.test(t)) return false;
+  if (/^\d+[.)]\s|[:?!]|\b(?:what|how|when|why|which|who|vs|versus|alternatives?|best|top|guide|review|glance|faq|our|your|trial|demo)\b/i.test(t)) return false;
+  return t.split(/\s+/).length <= 4;
+}
+
 /** Words of `label` that are not the entity's own words: "Sales Hub Starter" for HubSpot → itself. */
 function planFrom(label: string, entity: string): string | null {
   const need = new Set(sectionTokens(entity));
@@ -137,6 +150,25 @@ function attributeFrom(before: string): string {
   if (/\bstorage\b/.test(b)) return 'storage_price';
   if (/\bcompute\b/.test(b)) return 'compute_price';
   return 'price';
+}
+
+/**
+ * "Zoho" (from a search query) and "Zoho CRM" (from memory) name the same product: keep the most
+ * specific name, so the owner of a price isn't lost to a tie between two names for one vendor, and
+ * the observation carries the name the stored claim uses. Live regression: "Standard Plan… $14/month"
+ * on the earlier answer's own Zoho page was dropped because "Zoho" and "Zoho CRM" both matched.
+ */
+function oneNamePerVendor<T extends { e: string; i: number }>(xs: T[]): T[] {
+  const key = (e: string) => entityNeed(e).join(' ');
+  return xs.filter((x) => !xs.some((y) => y !== x && key(y.e) === key(x.e) && (y.e.length > x.e.length || (y.e.length === x.e.length && xs.indexOf(y) < xs.indexOf(x)))));
+}
+
+/** The attribute a unit implies on its own: compute per CU-hour, storage per GB-month. */
+function unitAttribute(unit: string | null): string | null {
+  if (!unit) return null;
+  if (/cu[- ]?hour/i.test(unit)) return 'compute_price';
+  if (/gb[- ]?month/i.test(unit)) return 'storage_price';
+  return null;
 }
 
 /** Where in `s` does `entity` start (by its first distinguishing word)? -1 when absent. */
@@ -178,12 +210,12 @@ export function extractObservations(ev: Evidence, entities: string[], now: Date)
   for (const s of sentences(ev.excerpt)) {
     const monies = [...s.matchAll(MONEY)];
     if (!monies.length) continue;
-    const named = inPlay.map((e) => ({ e, i: mentionIndex(e, s) })).filter((x) => x.i >= 0);
+    const named = oneNamePerVendor(inPlay.map((e) => ({ e, i: mentionIndex(e, s) })).filter((x) => x.i >= 0));
     let fallback: string | null = null;
     if (!named.length) {
       const ctx = `${ev.title}\n${headingOf(s)}`;
-      const inCtx = inPlay.filter((e) => entityMentioned(e, ctx));
-      if (inCtx.length === 1) fallback = inCtx[0];
+      const inCtx = oneNamePerVendor(inPlay.filter((e) => entityMentioned(e, ctx)).map((e) => ({ e, i: 0 })));
+      if (inCtx.length === 1) fallback = inCtx[0].e;
     }
     for (const m of monies) {
       const i = m.index!;
@@ -204,7 +236,7 @@ export function extractObservations(ev: Evidence, entities: string[], now: Date)
       const plan =
         (lead && i > lead[0].length - 2 ? planFrom(lead[1], owner) : null) ??
         (PLAN_NEAR.exec(s) ? planFrom(PLAN_NEAR.exec(s)![1], owner) : null) ??
-        (heading && !/pric|plan|cost|overview|compar/i.test(heading) ? planFrom(heading, owner) : null);
+        (heading && looksLikePlanHeading(heading) ? planFrom(heading, owner) : null);
       const { unit, period } = describeUnit(after);
       // "$0.106 per CU-hour compute, $0.35 per GB-month storage": the words after a price name it first.
       const clause = after.split(/,/)[0];
@@ -212,7 +244,14 @@ export function extractObservations(ev: Evidence, entities: string[], now: Date)
       // plan's own price. Live regression: Supabase's Pro section lost its "$25" in scraping, and
       // "Additional projects from $10/mo" under "### Pro" was compared as the Pro price ($25 → $10).
       const ownClause = before.split(/[.;:,]/).pop() ?? '';
-      const attribute = ADDON_BEFORE.test(ownClause) || ADDON_AFTER.test(clause) ? 'addon_price' : attributeFrom(clause) !== 'price' ? attributeFrom(clause) : attributeFrom(before);
+      const byWords = ADDON_BEFORE.test(ownClause) || ADDON_AFTER.test(clause) ? 'addon_price' : attributeFrom(clause) !== 'price' ? attributeFrom(clause) : attributeFrom(before);
+      // No word names it, but the unit does: "$0.106 per CU-hr" is a compute price, "$0.35 per GB-month"
+      // a storage price. Live regression: Neon's own Launch line was skipped for want of the word "compute".
+      // Only on a plain line ("+ $0.35 per GB-month"): "$0.20 per GB-month based on data changes" or
+      // "100 snapshots $0.09/GB-month" are other charges in the same unit.
+      const rest = s.slice(i + m[0].length).trim();
+      const plain = /^[\s+*•·-]*$/.test(s.slice(0, i)) && /^(?:\/\s*|per\s+)[a-z0-9-]+(?:[- ][a-z0-9-]+)?\.?$/i.test(rest);
+      const attribute = byWords === 'price' && plain ? (unitAttribute(unit) ?? byWords) : byWords;
       out.push({ ...base, kind: 'price', entity: owner, plan, attribute, value, unit, period, qualifiers: detectQualifiers(s), span: s.slice(0, 300), effectiveDate: effectiveDateIn(s, ref), eventDate: null });
     }
   }

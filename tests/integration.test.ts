@@ -28,6 +28,9 @@ const web = vi.hoisted(() => ({
   handler: null as null | ((p: any) => any[]),
   delayMs: 0,
   calls: [] as any[],
+  /** Pages re-opened by URL (Tavily extract): url → markdown, or absent = could not open. */
+  pages: {} as Record<string, string>,
+  extracts: [] as string[][],
 }));
 const sleep = vi.hoisted(
   () => (ms: number, signal?: AbortSignal) =>
@@ -74,6 +77,11 @@ vi.mock('../src/search/tavily.js', () => ({
     web.calls.push(p);
     if (web.delayMs) await sleep(web.delayMs, signal);
     return { results: web.handler ? web.handler(p) : [], credits: 1 };
+  }),
+  tavilyExtract: vi.fn(async (urls: string[]) => {
+    web.extracts.push(urls);
+    const results = urls.filter((u) => web.pages[u]).map((u) => ({ url: u, title: `Page ${u}`, raw_content: web.pages[u] }));
+    return { results, failed: urls.filter((u) => !web.pages[u]), credits: Math.ceil(results.length / 5) };
   }),
 }));
 
@@ -140,6 +148,8 @@ beforeEach(() => {
   web.handler = null;
   web.delayMs = 0;
   web.calls = [];
+  web.pages = {};
+  web.extracts = [];
   clearCache();
 });
 
@@ -179,7 +189,8 @@ describe('sample 1: CRM shortlist re-check (new conversation)', () => {
 
     expect(text).toMatch(/\| HubSpot \(Sales Hub Starter\) · price \| \$9 per seat per month \(blog\.hubspot\.com\) \| \$9 per seat per month \[S\d+\][^|]*\| Unchanged \|/);
     expect(text).toMatch(/\| Salesforce \(Sales Cloud Essentials\)[^\n]*not substituted/);
-    expect(text).toMatch(/\| Zoho CRM \(Standard\)[^\n]*third-party[^\n]*Can't verify: only a secondary source \(whizzbridge\.com\)/);
+    // The earlier answer's own (third-party) page states the same value today: reported, never confirmed.
+    expect(text).toMatch(/\| Zoho CRM \(Standard\)[^\n]*third-party[^\n]*Can't verify: the same page the earlier answer used \(whizzbridge\.com, secondary\) states \$14 per seat per month today[^\n]*reported, not confirmed/);
     expect(text).toMatch(/\| Pipedrive \(Essential\)[^\n]*Not comparable: different currencies \(USD vs EUR\)/);
     expect(text).toMatch(/\| Freshsales \| No earlier value recorded; cannot compare\. \| – \| Not recorded \|/);
     // Verdict derived from the rows: never "nothing changed" above unverifiable rows.
@@ -214,6 +225,45 @@ describe('sample 1: CRM shortlist re-check (new conversation)', () => {
     expect(r.debug.memory.turns[0]).toMatchObject({ conversationId: 'fx-crm', sameConversation: true, date: '2026-11-09' });
     expect(r.debug.memory.anchorDate).toBe('2026-11-09');
     expect(r.answer).toContain('**Re-check since Mon 9 Nov 2026**');
+  });
+
+  it("goes back to the earlier answer's own sources: re-opens the pages it cited and searches only its websites", async () => {
+    web.handler = CRM_WEB;
+    // The HubSpot page the earlier answer cited, as it reads today (with its heading and table header).
+    web.pages['https://blog.hubspot.com/sales/hubspot-sales-hub-pricing'] = [
+      "# HubSpot's Sales Hub pricing guide",
+      '## Sales Hub Starter',
+      '| Plan | Price |',
+      '|---|---|',
+      '| Sales Hub Starter | $9 per seat per month, billed annually |',
+    ].join('\n');
+    llm.steps.push((params) => {
+      const tool = params.messages.filter((m: any) => m.role === 'tool').map((m: any) => m.content).join('\n');
+      expect(tool).toContain('The pages the earlier answer cited, opened again just now');
+      expect(tool).toContain('## Sales Hub Starter\n| Plan | Price |'); // heading and table header travel with the row
+      return { content: 'See the comparison above.' };
+    });
+    const r = await turn(CRM_Q);
+
+    // Every page the earlier answer cited was re-opened, official sources first.
+    expect(web.extracts).toHaveLength(1);
+    expect(web.extracts[0]).toEqual([
+      'https://blog.hubspot.com/sales/hubspot-sales-hub-pricing',
+      'https://www.salesforce.com/small-business/pricing',
+      'https://www.whizzbridge.com/blog/zoho-pricing',
+      'https://www.stork.ai/blog/close-alternatives-2026',
+    ]);
+    expect(r.debug.searches.some((s: any) => s.query === 're-open 4 pages the earlier answer cited' && s.results === 1)).toBe(true);
+    // Each item's current-source search is limited to the website the earlier answer used for it.
+    const primary = (name: string) => web.calls.find((p) => kindOf(p) === 'primary' && p.query.includes(name));
+    expect(primary('HubSpot').include_domains).toEqual(['hubspot.com']);
+    expect(primary('Salesforce').include_domains).toEqual(['salesforce.com']);
+    expect(primary('Zoho').include_domains).toEqual(['whizzbridge.com']);
+    expect(primary('Pipedrive').include_domains).toEqual(['stork.ai']);
+    // An item with no earlier source is searched normally.
+    expect(primary('Freshsales').include_domains ?? []).toEqual([]);
+    // The re-opened HubSpot page itself confirms the value is unchanged.
+    expect(r.answer).toMatch(/\| HubSpot \(Sales Hub Starter\) · price \| \$9 per seat per month \(blog\.hubspot\.com\) \| \$9 per seat per month \[S\d+\][^|]*\| Unchanged \|/);
   });
 });
 

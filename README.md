@@ -45,7 +45,7 @@ Turn on **Debug** (top right) to see the resolved dates, the injected memory, ev
 ### Other scripts
 
 ```bash
-npm test                      # vitest: 163 tests, incl. full turns with scripted model + search (tests/integration.test.ts)
+npm test                      # vitest: 179 tests, incl. full turns with scripted model + search (tests/integration.test.ts)
 npm run typecheck
 npm run ask -- "question"     # one turn from the CLI: prints the stream, debug summary, memory written, telemetry
 bash scripts/e2e.sh           # the sample questions + abstention + small talk, paced for the free tier
@@ -61,8 +61,10 @@ browser (vanilla JS, SSE)  →  POST /api/chat {message, conversationId, tz}
   2. agent/router.ts       memory? change? pure recall? launches? small talk? (regex, no LLM hop)
   3. memory/retrieve.ts    all conversations, INCLUDING this one → <memory> block, or an explicit absence
        └ pure recall, nothing found → answer straight from retrieval, no model call
-       └ re-check              → searches + code comparison run BEFORE the model (prefetch)
-  4. search/tool.ts        parallel Tavily calls → dedupe, heading-aware excerpts, tiers (publisher relationships)
+       └ re-check              → re-open the pages the earlier answer cited, search only the websites it
+                                 used (+ news), and run the code comparison BEFORE the model (prefetch)
+  4. search/tool.ts        parallel Tavily calls → dedupe, excerpt chunks that each carry the heading path and
+                           table header row, tiers (publisher relationships)
        └ evidence/observations.ts   what each source states: prices (plan, unit, terms) + announcements, with dates
        └ verify/reverify.ts         stored answer assertion vs official observation → comparison rows (code)
   5. agent/loop.ts         validated comparison streams first; Groq gpt-oss-120b writes the rest (one tool, web_search)
@@ -95,7 +97,9 @@ A small JSON model call happens only when code cannot read a needed value from a
 | A different plan is never substituted. A currency, unit, billing period, billing term or region stated on only one side is "not comparable". | `lookupCurrent`, `compareValues` |
 | Precision-aware equality: $0.001 → $0.002 is a change. Rounding is tolerated only for a converted yearly price. | `verify/diff.ts` |
 | "Differs from our earlier answer" is kept apart from "Changed". Changed needs evidence that the vendor's own statement changed. | `buildRow` |
-| Official pages dated before the anchor, conflicting official sources, and third-party baselines stay visibly uncertain. | `lookupCurrent`, `buildRow` |
+| "Now" must be current: a live vendor page (pricing, plans, docs) counts if updated within the last year, because a price unchanged since April is still today's price; an article (blog, news, changelog) counts only if published on or after the earlier answer. Conflicting official pages and third-party baselines stay visibly uncertain. | `answer/freshness.ts`, `lookupCurrent`, `buildRow` |
+| A price never travels without its product: excerpts restate the heading path and table header in every chunk, a search snippet is located on the page to recover its heading, and a model variant ("Flash-Lite", "Native Audio") is a different product. | `search/postprocess.ts`, `verify/support.ts` |
+| "Confirmed" needs an official, current source that states the value on that line; otherwise the label is withdrawn. | `answer/labels.ts` |
 | Publication date, fetch date (the original one on a cache hit) and effective/event date stay distinct. | `search/cache.ts`, `evidence/observations.ts` |
 | The verdict sentence is computed from the rows: never "nothing changed" above rows that couldn't be verified, never "still correct" while earlier non-price statements are unchecked. | `headline()`, narrative guard |
 | Memory reflects the delivered answer: table, prose and bullets store the same facts. Unsupported prices are kept but never used as baselines. | `memory/assertions.ts` |
@@ -106,7 +110,7 @@ A small JSON model call happens only when code cannot read a needed value from a
 ## Free-tier limits and cost
 
 - **Groq:** 8,000 tokens/minute per model. The whole request (system prompt, memory, history, tool results and the tool definition) is fitted under about 5.8k tokens. Older search excerpts are shortened first; source headers and the comparison block never are. On a 429, the client waits only if `retry-after` is short (≤ 6 s) and fits the time left; otherwise it moves on to `gpt-oss-20b` (a separate bucket). There is one pass over the chain, with no minute-long second round. Optional fallbacks: `GEMINI_API_KEY`, `OPENROUTER_API_KEY`.
-- **Tavily:** about 1,000 free credits a month, and every call is `search_depth: "basic"` (1 credit). A lookup costs 1–4 credits. A re-check costs 2 per product, or 3 when the question asks about launches (current page + news + vendor release notes). Results are cached in memory for 15 minutes.
+- **Tavily:** about 1,000 free credits a month, and every call is `search_depth: "basic"` (1 credit). A lookup costs 1–4 credits. A re-check costs 2 per product, or 3 when the question asks about launches (current page + news + vendor release notes), plus 1 credit per 5 earlier-cited pages it re-opens. Results are cached in memory for 15 minutes.
 
 ## Layout
 

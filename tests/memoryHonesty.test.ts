@@ -93,7 +93,8 @@ describe('domainsForQuery with one domain and several queries', () => {
 describe('buildRecheckPlan', () => {
   it('covers listed items that have no stored value', () => {
     const plan = buildRecheckPlan([], '2026-11-03', ['Neon', 'Supabase', 'AWS RDS']);
-    expect(plan).toEqual({ since: '2026-11-03', queries: ['Neon pricing', 'Supabase pricing', 'AWS RDS pricing'], domains: [] });
+    // No earlier source for these items: nothing to re-open, and their searches are not restricted.
+    expect(plan).toEqual({ since: '2026-11-03', queries: ['Neon pricing', 'Supabase pricing', 'AWS RDS pricing'], domains: [], pages: [], sites: {} });
   });
   it('nothing to re-check without claims or items', () => {
     expect(buildRecheckPlan([], '2026-11-03', [])).toBeNull();

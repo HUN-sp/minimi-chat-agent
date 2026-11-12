@@ -68,7 +68,8 @@ export const config = {
     resultsPerQuery: 5,
     resultsPerQueryPaired: 3, // per side when `since` triggers the primary+news pair
     excerptChars: 1200,
-    sectionChars: 1600, // heading-aware section of an official page
+    sectionChars: 1600, // what the model is shown per source (official pages: twice this), in whole chunks
+    chunkChars: 1200, // one self-contained excerpt chunk: heading path + table header + rows
     toolResultChars: 7_500, // whole tool result, ≈2.8k tokens (Groq free tier: 8k TPM)
     memoryChars: 6000, // ≈1.5k tokens
     historyMessages: 6,

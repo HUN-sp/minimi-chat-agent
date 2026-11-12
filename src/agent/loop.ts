@@ -10,7 +10,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ChatCompletionMessageFunctionToolCall as ChatCompletionMessageToolCall, ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 import { autoCite } from '../answer/autocite.js';
-import { enforceLabels } from '../answer/labels.js';
+import { enforceLabels, markUnconfirmed } from '../answer/labels.js';
 import { inconsistencies } from '../answer/consistency.js';
 import { stalePrices } from '../answer/freshness.js';
 import { checkCitedValues, checkGrounding } from '../answer/grounding.js';
@@ -222,6 +222,8 @@ async function turn(opts: TurnOptions, deadline: Deadline): Promise<TurnResult> 
     budget: extractionBudget,
     allowModel: () => deadline.remaining() > B.answerReserveMs + 3000,
     telemetry,
+    // A re-check goes back to the earlier answer's own sources (pages re-opened, its websites searched).
+    recheckSources: memory.recheck,
   };
 
   // Code-rendered, validated content shown above the model's reply (the re-check comparison).
@@ -371,7 +373,9 @@ async function turn(opts: TurnOptions, deadline: Deadline): Promise<TurnResult> 
 
   // 4. Checks on the model's text (code, not prompting)
   const valid = registry.ids();
-  const comparisonTurn = r.changeIntent && (memory.turns.length > 0 || !!ctx.comparison);
+  // A code comparison on screen (a "has it changed?" re-check, or a repeated question re-checked
+  // against its earlier answer) is authoritative: the model's text can't re-invent Then values or verdicts.
+  const comparisonTurn = (r.changeIntent && memory.turns.length > 0) || !!ctx.comparison;
   // Earlier answers the model can see: recalled turns + this chat's recent history.
   const priorAnswers = history.filter((m) => m.role === 'assistant' && !m.failed);
   const priorDates = [...new Set([...memory.turns.map((t) => t.user.local_date), ...priorAnswers.map((m) => m.local_date)])].sort();
@@ -421,6 +425,13 @@ async function turn(opts: TurnOptions, deadline: Deadline): Promise<TurnResult> 
   const valueMisses = checkCitedValues(narrative, evidence, recorded.map((c) => c.value))
     .map((v) => ({ ...v, values: v.values.filter((x) => !parsedValues.has(x)) }))
     .filter((v) => v.values.length);
+  // A "Confirmed" label on a line whose value the cited source doesn't state is withdrawn on that line,
+  // so the answer never says "Confirmed" above a "Not confirmed" note about the same value.
+  const unconfirmed = markUnconfirmed(narrative, [
+    ...unsupported.map((c) => ({ value: c.value, ids: c.sources })),
+    ...valueMisses.flatMap((v) => v.values.map((value) => ({ value, ids: v.ids }))),
+  ]);
+  narrative = unconfirmed.text;
   const earlier = memory.repeatOf?.assistant ? recorded.filter((c) => c.message_id === memory.repeatOf!.assistant!.id) : [];
   const drift = earlier.length ? inconsistencies(narrative, earlier) : [];
   const notes: string[] = [];
@@ -506,7 +517,7 @@ async function turn(opts: TurnOptions, deadline: Deadline): Promise<TurnResult> 
     guard: { removed: guardRemoved, thenValuesRemoved: thenReplaced },
     clarification,
     checks: { stalePrices: stale, ungrounded, priceNotInSource: valueMisses, differsFromEarlier: drift, uncitedPrices: uncited.map((c) => `${c.entity} ${c.value}`) },
-    citations: { used: cites.used, dropped: validateCitations(answer, valid).dropped, autoCited: auto.added, labelsDowngraded: labels.downgraded },
+    citations: { used: cites.used, dropped: validateCitations(answer, valid).dropped, autoCited: auto.added, labelsDowngraded: labels.downgraded + unconfirmed.downgraded },
     claimCheck: claimChecks.map((c) => ({ entity: c.entity, plan: c.plan, attribute: c.attribute, value: c.value, sources: c.sources, supported: c.supported, approximate: c.approximate, reason: c.reason })),
   };
 
